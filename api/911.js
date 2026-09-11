@@ -1,106 +1,68 @@
-/*
-=========================================================
-AVERON 911 API
-=========================================================
-
-Vercel route:
-
-GET /api/911
-GET /api/911?limit=100
-GET /api/911?hours=24
-GET /api/911?agency=New%20Orleans%20911
-
-IMPORTANT:
-This route does NOT intercept 911 communications.
-
-It only consumes:
-- Publicly available emergency-call data
-- Authorized recording APIs
-- Authorized recording URLs
-- Public agency feeds
-
-Actual caller/dispatcher recordings must come from
-a source that legally exposes/provides them.
-
-=========================================================
-*/
-
 const DEFAULT_HOURS = 24;
 const MAX_HOURS = 168;
+
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 250;
 
 /*
 =========================================================
-SOURCE CONFIGURATION
+PUBLIC CAD SOURCE
+=========================================================
+*/
+
+const NOLA_API =
+  "https://data.nola.gov/resource/es9j-6y5d.json";
+
+const NOLA_PAGE =
+  "https://data.nola.gov/Public-Safety-and-Preparedness/Calls-for-Service-2026/es9j-6y5d";
+
+/*
+=========================================================
+PUBLIC 911 AUDIO ARCHIVE
 =========================================================
 
-You can add additional sources here.
+These recordings are publicly published by NCDSV.
 
-Each source should return:
+The archive page is used as the catalog source.
 
-{
-  id,
-  agency,
-  city,
-  state,
-  receivedAt,
-  endedAt,
-  type,
-  priority,
-  location,
-  audioUrl,
-  transcript,
-  source,
-  sourceUrl,
-  audioAvailable,
-  lat,
-  lng
-}
-
-Do NOT put private API keys directly in this file.
-
-Use Vercel environment variables.
+We discover actual audio links from the page instead
+of inventing filenames or URLs.
 
 =========================================================
 */
 
-const SOURCES = [
-  {
-    name: "authorized_911",
+const NCDSV_PAGE =
+  "https://www.ncdsv.org/911-audio-recordings.html";
 
-    enabled: Boolean(
+/*
+=========================================================
+OPTIONAL AUTHORIZED AUDIO SOURCE
+=========================================================
+
+Vercel:
+
+AUTHORIZED_911_API_URL
+AUTHORIZED_911_API_KEY
+
+=========================================================
+*/
+
+const AUTHORIZED_SOURCE = {
+  name: "authorized_911",
+
+  enabled:
+    Boolean(
       process.env.AUTHORIZED_911_API_URL
     ),
 
-    url:
-      process.env.AUTHORIZED_911_API_URL || "",
+  url:
+    process.env.AUTHORIZED_911_API_URL ||
+    "",
 
-    apiKey:
-      process.env.AUTHORIZED_911_API_KEY || ""
-  }
-
-  /*
-  -------------------------------------------------------
-  ADD MORE SOURCES HERE
-  -------------------------------------------------------
-
-  {
-    name: "agency_two",
-
-    enabled: Boolean(
-      process.env.AGENCY_TWO_911_URL
-    ),
-
-    url:
-      process.env.AGENCY_TWO_911_URL || "",
-
-    apiKey:
-      process.env.AGENCY_TWO_911_KEY || ""
-  }
-
-  */
-];
+  apiKey:
+    process.env.AUTHORIZED_911_API_KEY ||
+    ""
+};
 
 /*
 =========================================================
@@ -108,29 +70,20 @@ HELPERS
 =========================================================
 */
 
-function json(res, status, body) {
-  return res.status(status).json(body);
+function json(
+  res,
+  status,
+  body
+) {
+  return res
+    .status(status)
+    .json(body);
 }
 
-function parseDate(value) {
-  if (!value) return null;
-
-  const date = new Date(value);
-
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-
-  return date;
-}
-
-function isFresh(date, cutoff) {
-  if (!date) return false;
-
-  return date.getTime() >= cutoff;
-}
-
-function cleanString(value, fallback = "") {
+function cleanString(
+  value,
+  fallback = ""
+) {
   if (
     value === null ||
     value === undefined
@@ -138,7 +91,29 @@ function cleanString(value, fallback = "") {
     return fallback;
   }
 
-  return String(value).trim();
+  const result =
+    String(value).trim();
+
+  return result || fallback;
+}
+
+function parseDate(value) {
+  if (!value) {
+    return null;
+  }
+
+  const date =
+    new Date(value);
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return null;
+  }
+
+  return date;
 }
 
 function numberOrNull(value) {
@@ -150,53 +125,786 @@ function numberOrNull(value) {
     return null;
   }
 
-  const number = Number(value);
+  const number =
+    Number(value);
 
-  return Number.isFinite(number)
+  return Number.isFinite(
+    number
+  )
     ? number
     : null;
 }
 
+/*
+=========================================================
+PRIORITY
+=========================================================
+*/
+
 function normalizePriority(value) {
-  const priority = cleanString(
-    value,
-    "UNKNOWN"
-  ).toUpperCase();
+  const raw =
+    cleanString(
+      value,
+      "UNKNOWN"
+    ).toUpperCase();
 
   if (
-    priority.includes("CRITICAL") ||
-    priority.includes("HIGH") ||
-    priority === "1"
+    raw === "1" ||
+    raw.startsWith("1")
   ) {
     return "HIGH";
   }
 
   if (
-    priority.includes("MEDIUM") ||
-    priority.includes("MODERATE") ||
-    priority === "2"
+    raw === "2" ||
+    raw.startsWith("2")
   ) {
     return "MEDIUM";
   }
 
   if (
-    priority.includes("LOW") ||
-    priority === "3"
+    raw === "3" ||
+    raw.startsWith("3")
   ) {
     return "LOW";
   }
 
-  return priority || "UNKNOWN";
+  if (
+    raw.includes("CRITICAL") ||
+    raw.includes("HIGH")
+  ) {
+    return "HIGH";
+  }
+
+  if (
+    raw.includes("MEDIUM") ||
+    raw.includes("MODERATE")
+  ) {
+    return "MEDIUM";
+  }
+
+  if (
+    raw.includes("LOW")
+  ) {
+    return "LOW";
+  }
+
+  return raw;
 }
 
 /*
 =========================================================
-NORMALIZE A CALL
+POINT PARSER
 =========================================================
 */
 
-function normalizeCall(raw, sourceName) {
-  if (!raw || typeof raw !== "object") {
+function parsePoint(
+  value
+) {
+  if (!value) {
+    return {
+      lat: null,
+      lng: null
+    };
+  }
+
+  const match =
+    String(value).match(
+      /POINT\s*\(\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\)/i
+    );
+
+  if (!match) {
+    return {
+      lat: null,
+      lng: null
+    };
+  }
+
+  return {
+    lng:
+      Number(match[1]),
+
+    lat:
+      Number(match[2])
+  };
+}
+
+/*
+=========================================================
+NOLA CAD NORMALIZATION
+=========================================================
+*/
+
+function normalizeNolaCall(
+  raw
+) {
+  if (
+    !raw ||
+    typeof raw !== "object"
+  ) {
+    return null;
+  }
+
+  const receivedAt =
+    raw.timecreate ||
+    raw.time_create ||
+    null;
+
+  const dispatchedAt =
+    raw.timedispatch ||
+    raw.time_dispatch ||
+    null;
+
+  const arrivedAt =
+    raw.timearrive ||
+    raw.time_arrive ||
+    null;
+
+  const closedAt =
+    raw.timeclosed ||
+    raw.time_closed ||
+    null;
+
+  const point =
+    parsePoint(
+      raw.location
+    );
+
+  const id =
+    cleanString(
+      raw.nopd_item ||
+      raw.id,
+      `NOLA-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`
+    );
+
+  return {
+    id,
+
+    agency:
+      "New Orleans 911 / NOPD",
+
+    city:
+      "New Orleans",
+
+    state:
+      "LA",
+
+    receivedAt:
+      parseDate(
+        receivedAt
+      )?.toISOString() ||
+      null,
+
+    endedAt:
+      parseDate(
+        closedAt
+      )?.toISOString() ||
+      null,
+
+    dispatchedAt:
+      parseDate(
+        dispatchedAt
+      )?.toISOString() ||
+      null,
+
+    arrivedAt:
+      parseDate(
+        arrivedAt
+      )?.toISOString() ||
+      null,
+
+    type:
+      cleanString(
+        raw.typetext ||
+        raw.initialtypetext ||
+        raw.type_,
+        "911 Call"
+      ),
+
+    priority:
+      normalizePriority(
+        raw.priority ||
+        raw.initialpriority
+      ),
+
+    location:
+      cleanString(
+        raw.block_address ||
+        raw.blockaddress ||
+        raw.address,
+        "Location unavailable"
+      ),
+
+    audioUrl:
+      null,
+
+    transcript:
+      "",
+
+    audioAvailable:
+      false,
+
+    audioType:
+      null,
+
+    audioSource:
+      null,
+
+    isLive:
+      true,
+
+    isSimulated:
+      false,
+
+    source:
+      "New Orleans Calls for Service 2026",
+
+    sourceUrl:
+      NOLA_PAGE,
+
+    disposition:
+      cleanString(
+        raw.dispositiontext ||
+        raw.disposition
+      ) || null,
+
+    beat:
+      cleanString(
+        raw.beat
+      ) || null,
+
+    policeDistrict:
+      cleanString(
+        raw.policedistrict ||
+        raw.police_district
+      ) || null,
+
+    zip:
+      cleanString(
+        raw.zip
+      ) || null,
+
+    initialType:
+      cleanString(
+        raw.initialtypetext ||
+        raw.initialtype
+      ) || null,
+
+    initialPriority:
+      cleanString(
+        raw.initialpriority
+      ) || null,
+
+    lat:
+      point.lat,
+
+    lng:
+      point.lng
+  };
+}
+
+/*
+=========================================================
+FETCH NEW ORLEANS CAD
+=========================================================
+*/
+
+async function fetchNewOrleans(
+  cutoff,
+  limit
+) {
+  try {
+    const cutoffDate =
+      new Date(
+        cutoff
+      ).toISOString();
+
+    const params =
+      new URLSearchParams();
+
+    params.set(
+      "$limit",
+      String(
+        Math.min(
+          limit,
+          MAX_LIMIT
+        )
+      )
+    );
+
+    params.set(
+      "$order",
+      "timecreate DESC"
+    );
+
+    params.set(
+      "$where",
+      `timecreate >= '${cutoffDate}'`
+    );
+
+    const url =
+      `${NOLA_API}?${params.toString()}`;
+
+    console.log(
+      `[911] NOLA request: ${url}`
+    );
+
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+
+          headers: {
+            Accept:
+              "application/json"
+          },
+
+          cache:
+            "no-store"
+        }
+      );
+
+    if (
+      !response.ok
+    ) {
+      const errorText =
+        await response
+          .text()
+          .catch(
+            () => ""
+          );
+
+      console.error(
+        `[911] NOLA HTTP ${response.status}`,
+        errorText.slice(
+          0,
+          500
+        )
+      );
+
+      return [];
+    }
+
+    const data =
+      await response.json();
+
+    if (
+      !Array.isArray(data)
+    ) {
+      return [];
+    }
+
+    console.log(
+      `[911] NOLA records: ${data.length}`
+    );
+
+    return data
+      .map(
+        normalizeNolaCall
+      )
+      .filter(Boolean);
+
+  } catch (
+    error
+  ) {
+    console.error(
+      "[911] NOLA failed:",
+      error?.message ||
+        error
+    );
+
+    return [];
+  }
+}
+
+/*
+=========================================================
+NCDSV AUDIO ARCHIVE
+=========================================================
+
+The page contains links to publicly posted recordings.
+
+We parse those links dynamically.
+
+We ONLY accept actual audio extensions:
+
+.mp3
+.wav
+.m4a
+.ogg
+.aac
+
+No simulated source is added.
+
+=========================================================
+*/
+
+function absoluteUrl(
+  href,
+  base
+) {
+  try {
+    return new URL(
+      href,
+      base
+    ).toString();
+  } catch {
+    return null;
+  }
+}
+
+function decodeHtml(
+  value
+) {
+  return String(value)
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&lt;/gi,
+      "<"
+    )
+    .replace(
+      /&gt;/gi,
+      ">"
+    );
+}
+
+function stripHtml(
+  value
+) {
+  return decodeHtml(
+    String(value)
+      .replace(
+        /<[^>]*>/g,
+        " "
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim()
+  );
+}
+
+function audioExtension(
+  url
+) {
+  try {
+    const pathname =
+      new URL(
+        url
+      ).pathname
+        .toLowerCase();
+
+    const match =
+      pathname.match(
+        /\.(mp3|wav|m4a|ogg|aac)$/
+      );
+
+    return match
+      ? match[1]
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function makeArchiveId(
+  url
+) {
+  return `NCDSV-${Buffer
+    .from(url)
+    .toString("base64")
+    .replace(
+      /[^a-zA-Z0-9]/g,
+      ""
+    )
+    .slice(0, 32)}`;
+}
+
+/*
+=========================================================
+PARSE NCDSV PAGE
+=========================================================
+*/
+
+async function fetchNcdsvAudio() {
+  try {
+    const response =
+      await fetch(
+        NCDSV_PAGE,
+        {
+          method: "GET",
+
+          headers: {
+            Accept:
+              "text/html,application/xhtml+xml",
+            "User-Agent":
+              "Averon Public Safety Centre"
+          },
+
+          cache:
+            "no-store"
+        }
+      );
+
+    if (
+      !response.ok
+    ) {
+      console.error(
+        `[911] NCDSV HTTP ${response.status}`
+      );
+
+      return [];
+    }
+
+    const html =
+      await response.text();
+
+    /*
+    -----------------------------------------------------
+    Find links.
+
+    This handles normal:
+
+    <a href="file.mp3">Name</a>
+
+    -----------------------------------------------------
+    */
+
+    const linkRegex =
+      /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+
+    const results = [];
+
+    let match;
+
+    while (
+      (match =
+        linkRegex.exec(
+          html
+        )) !== null
+    ) {
+      const href =
+        match[1];
+
+      const text =
+        stripHtml(
+          match[2]
+        );
+
+      const url =
+        absoluteUrl(
+          href,
+          NCDSV_PAGE
+        );
+
+      if (!url) {
+        continue;
+      }
+
+      const extension =
+        audioExtension(
+          url
+        );
+
+      if (!extension) {
+        continue;
+      }
+
+      results.push({
+        id:
+          makeArchiveId(
+            url
+          ),
+
+        agency:
+          "Public 911 Audio Archive",
+
+        city:
+          "",
+
+        state:
+          "",
+
+        receivedAt:
+          null,
+
+        endedAt:
+          null,
+
+        dispatchedAt:
+          null,
+
+        arrivedAt:
+          null,
+
+        type:
+          text ||
+          "Archived 911 Recording",
+
+        priority:
+          "UNKNOWN",
+
+        location:
+          "Historical recording",
+
+        audioUrl:
+          url,
+
+        transcript:
+          "",
+
+        audioAvailable:
+          true,
+
+        audioType:
+          extension
+            .toUpperCase(),
+
+        audioSource:
+          "NCDSV",
+
+        isLive:
+          false,
+
+        isSimulated:
+          false,
+
+        source:
+          "National Center on Domestic and Sexual Violence",
+
+        sourceUrl:
+          NCDSV_PAGE,
+
+        lat:
+          null,
+
+        lng:
+          null
+      });
+    }
+
+    /*
+    -----------------------------------------------------
+    Remove duplicate URLs
+    -----------------------------------------------------
+    */
+
+    const seen =
+      new Set();
+
+    const unique = [];
+
+    for (
+      const item of results
+    ) {
+      if (
+        seen.has(
+          item.audioUrl
+        )
+      ) {
+        continue;
+      }
+
+      seen.add(
+        item.audioUrl
+      );
+
+      unique.push(
+        item
+      );
+    }
+
+    console.log(
+      `[911] NCDSV audio records: ${unique.length}`
+    );
+
+    return unique;
+
+  } catch (
+    error
+  ) {
+    console.error(
+      "[911] NCDSV failed:",
+      error?.message ||
+        error
+    );
+
+    return [];
+  }
+}
+
+/*
+=========================================================
+AUTHORIZED SOURCE
+=========================================================
+*/
+
+function extractArray(
+  payload
+) {
+  if (
+    Array.isArray(
+      payload
+    )
+  ) {
+    return payload;
+  }
+
+  if (
+    !payload ||
+    typeof payload !==
+      "object"
+  ) {
+    return [];
+  }
+
+  const keys = [
+    "calls",
+    "data",
+    "incidents",
+    "results",
+    "records",
+    "items"
+  ];
+
+  for (
+    const key of keys
+  ) {
+    if (
+      Array.isArray(
+        payload[key]
+      )
+    ) {
+      return payload[key];
+    }
+  }
+
+  return [];
+}
+
+function normalizeAuthorized(
+  raw
+) {
+  if (
+    !raw ||
+    typeof raw !==
+      "object"
+  ) {
     return null;
   }
 
@@ -226,98 +934,108 @@ function normalizeCall(raw, sourceName) {
     raw.recording ||
     null;
 
-  const transcript =
-    raw.transcript ||
-    raw.transcription ||
-    raw.text ||
-    "";
-
   const id =
-    raw.id ||
-    raw.callId ||
-    raw.call_id ||
-    raw.incidentId ||
-    raw.incident_id ||
-    `${sourceName}-${receivedAt || Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 9)}`;
+    cleanString(
+      raw.id ||
+      raw.callId ||
+      raw.call_id ||
+      raw.incidentId ||
+      raw.incident_id,
+      `AUTHORIZED-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`
+    );
 
   return {
-    id: cleanString(id),
+    id,
 
-    agency: cleanString(
-      raw.agency ||
-      raw.agencyName ||
-      raw.department ||
-      raw.psap ||
-      raw.psapName,
-      "Unknown 911 Center"
-    ),
+    agency:
+      cleanString(
+        raw.agency ||
+        raw.agencyName ||
+        raw.department ||
+        raw.psap ||
+        raw.psapName,
+        "Authorized 911 Center"
+      ),
 
-    city: cleanString(
-      raw.city ||
-      raw.municipality
-    ),
+    city:
+      cleanString(
+        raw.city ||
+        raw.municipality
+      ),
 
-    state: cleanString(
-      raw.state ||
-      raw.stateCode
-    ),
+    state:
+      cleanString(
+        raw.state ||
+        raw.stateCode
+      ),
 
     receivedAt:
-      parseDate(receivedAt)?.toISOString() ||
+      parseDate(
+        receivedAt
+      )?.toISOString() ||
       null,
 
     endedAt:
-      parseDate(endedAt)?.toISOString() ||
+      parseDate(
+        endedAt
+      )?.toISOString() ||
       null,
 
-    type: cleanString(
-      raw.type ||
-      raw.callType ||
-      raw.call_type ||
-      raw.incidentType ||
-      raw.incident_type,
-      "911 Call"
-    ),
+    dispatchedAt:
+      parseDate(
+        raw.dispatchedAt ||
+        raw.dispatch_at
+      )?.toISOString() ||
+      null,
 
-    priority: normalizePriority(
-      raw.priority ||
-      raw.priorityCode ||
-      raw.priority_code
-    ),
+    arrivedAt:
+      parseDate(
+        raw.arrivedAt ||
+        raw.arrived_at
+      )?.toISOString() ||
+      null,
 
-    location: cleanString(
-      raw.location ||
-      raw.address ||
-      raw.fullAddress ||
-      raw.crossStreet ||
-      raw.cross_street,
-      "Location unavailable"
-    ),
+    type:
+      cleanString(
+        raw.type ||
+        raw.callType ||
+        raw.call_type ||
+        raw.incidentType ||
+        raw.incident_type,
+        "911 Call"
+      ),
+
+    priority:
+      normalizePriority(
+        raw.priority ||
+        raw.priorityCode ||
+        raw.priority_code
+      ),
+
+    location:
+      cleanString(
+        raw.location ||
+        raw.address ||
+        raw.fullAddress ||
+        raw.crossStreet ||
+        raw.cross_street,
+        "Location unavailable"
+      ),
 
     audioUrl:
-      typeof audioUrl === "string" &&
+      typeof audioUrl ===
+        "string" &&
       audioUrl.trim()
         ? audioUrl.trim()
         : null,
 
     transcript:
-      typeof transcript === "string"
-        ? transcript.trim()
+      typeof raw.transcript ===
+        "string"
+        ? raw.transcript.trim()
         : "",
-
-    source: cleanString(
-      raw.source ||
-      raw.sourceName,
-      sourceName
-    ),
-
-    sourceUrl: cleanString(
-      raw.sourceUrl ||
-      raw.source_url ||
-      raw.url
-    ) || null,
 
     audioAvailable:
       Boolean(
@@ -326,116 +1044,98 @@ function normalizeCall(raw, sourceName) {
         audioUrl
       ),
 
-    lat: numberOrNull(
-      raw.lat ||
-      raw.latitude
-    ),
+    audioType:
+      cleanString(
+        raw.audioType ||
+        raw.audio_type ||
+        "AUTHORIZED"
+      ),
 
-    lng: numberOrNull(
-      raw.lng ||
-      raw.lon ||
-      raw.longitude
-    )
+    audioSource:
+      cleanString(
+        raw.audioSource ||
+        raw.audio_source ||
+        "Authorized provider"
+      ),
+
+    isLive:
+      raw.isLive ??
+      raw.is_live ??
+      true,
+
+    isSimulated:
+      false,
+
+    source:
+      cleanString(
+        raw.source ||
+        raw.sourceName,
+        "Authorized 911 Source"
+      ),
+
+    sourceUrl:
+      cleanString(
+        raw.sourceUrl ||
+        raw.source_url ||
+        raw.url
+      ) || null,
+
+    lat:
+      numberOrNull(
+        raw.lat ??
+        raw.latitude
+      ),
+
+    lng:
+      numberOrNull(
+        raw.lng ??
+        raw.lon ??
+        raw.longitude
+      )
   };
 }
 
-/*
-=========================================================
-EXTRACT ARRAY
-
-Allows APIs to return:
-
-[
-  ...
-]
-
-or:
-
-{
-  calls: [...]
-}
-
-or:
-
-{
-  data: [...]
-}
-
-or:
-
-{
-  incidents: [...]
-}
-
-or:
-
-{
-  results: [...]
-}
-
-=========================================================
-*/
-
-function extractArray(payload) {
-  if (Array.isArray(payload)) {
-    return payload;
-  }
-
-  if (!payload || typeof payload !== "object") {
-    return [];
-  }
-
-  const possibleKeys = [
-    "calls",
-    "data",
-    "incidents",
-    "results",
-    "records",
-    "items"
-  ];
-
-  for (const key of possibleKeys) {
-    if (Array.isArray(payload[key])) {
-      return payload[key];
-    }
-  }
-
-  return [];
-}
-
-/*
-=========================================================
-FETCH ONE AUTHORIZED SOURCE
-=========================================================
-*/
-
-async function fetchSource(source, cutoff) {
-  if (!source.enabled || !source.url) {
+async function fetchAuthorized(
+  cutoff
+) {
+  if (
+    !AUTHORIZED_SOURCE.enabled ||
+    !AUTHORIZED_SOURCE.url
+  ) {
     return [];
   }
 
   try {
     const headers = {
-      Accept: "application/json"
+      Accept:
+        "application/json"
     };
 
-    if (source.apiKey) {
+    if (
+      AUTHORIZED_SOURCE.apiKey
+    ) {
       headers.Authorization =
-        `Bearer ${source.apiKey}`;
+        `Bearer ${AUTHORIZED_SOURCE.apiKey}`;
     }
 
-    const response = await fetch(
-      source.url,
-      {
-        method: "GET",
-        headers,
-        cache: "no-store"
-      }
-    );
+    const response =
+      await fetch(
+        AUTHORIZED_SOURCE.url,
+        {
+          method: "GET",
 
-    if (!response.ok) {
+          headers,
+
+          cache:
+            "no-store"
+        }
+      );
+
+    if (
+      !response.ok
+    ) {
       console.error(
-        `[911] ${source.name} returned ${response.status}`
+        `[911] Authorized source HTTP ${response.status}`
       );
 
       return [];
@@ -445,30 +1145,64 @@ async function fetchSource(source, cutoff) {
       await response.json();
 
     const records =
-      extractArray(payload);
+      extractArray(
+        payload
+      );
 
     return records
-      .map((record) =>
-        normalizeCall(
-          record,
-          source.name
-        )
+      .map(
+        normalizeAuthorized
       )
       .filter(Boolean)
-      .filter((call) => {
-        const received =
-          parseDate(call.receivedAt);
+      .filter(
+        (call) => {
 
-        return isFresh(
-          received,
-          cutoff
-        );
-      });
+          /*
+          Never allow a provider to
+          accidentally mark a simulated
+          record as real.
+          */
 
-  } catch (error) {
+          if (
+            call.isSimulated
+          ) {
+            return false;
+          }
+
+          /*
+          Audio records without dates
+          are allowed because historical
+          archives may not have timestamps.
+          */
+
+          if (
+            call.receivedAt
+          ) {
+            const date =
+              parseDate(
+                call.receivedAt
+              );
+
+            if (
+              date &&
+              date.getTime() <
+                cutoff
+            ) {
+              return false;
+            }
+          }
+
+          return true;
+        }
+      );
+
+  } catch (
+    error
+  ) {
     console.error(
-      `[911] ${source.name} failed:`,
-      error?.message || error
+      "[911] Authorized source failed:",
+      error?.message ||
+        error
     );
 
     return [];
@@ -481,11 +1215,17 @@ DEDUPLICATION
 =========================================================
 */
 
-function deduplicate(calls) {
-  const map = new Map();
+function deduplicate(
+  calls
+) {
+  const map =
+    new Map();
 
-  for (const call of calls) {
+  for (
+    const call of calls
+  ) {
     const key =
+      call.audioUrl ||
       call.id ||
       [
         call.agency,
@@ -498,72 +1238,98 @@ function deduplicate(calls) {
       map.get(key);
 
     if (!existing) {
-      map.set(key, call);
+      map.set(
+        key,
+        call
+      );
+
       continue;
     }
 
-    /*
-    Prefer the version containing audio.
-    */
-
-    if (
-      call.audioAvailable &&
-      !existing.audioAvailable
-    ) {
-      map.set(key, call);
-      continue;
-    }
-
-    /*
-    Prefer the version containing a
-    transcript.
-    */
-
-    if (
-      call.transcript &&
-      !existing.transcript
-    ) {
-      map.set(key, {
+    map.set(
+      key,
+      {
         ...existing,
-        ...call
-      });
-    }
+        ...call,
+
+        audioUrl:
+          call.audioUrl ||
+          existing.audioUrl ||
+          null,
+
+        audioAvailable:
+          call.audioAvailable ||
+          existing.audioAvailable,
+
+        transcript:
+          call.transcript ||
+          existing.transcript ||
+          "",
+
+        lat:
+          call.lat ??
+          existing.lat ??
+          null,
+
+        lng:
+          call.lng ??
+          existing.lng ??
+          null
+      }
+    );
   }
 
-  return [...map.values()];
+  return [
+    ...map.values()
+  ];
 }
 
 /*
 =========================================================
-SORT NEWEST FIRST
+SORT
+=========================================================
+
+Historical archive items may not have
+a timestamp.
+
+Those remain after timestamped records.
+
 =========================================================
 */
 
-function sortNewest(calls) {
-  return calls.sort((a, b) => {
-    const aTime =
-      parseDate(a.receivedAt)?.getTime() ||
-      0;
+function sortCalls(
+  calls
+) {
+  return calls.sort(
+    (a, b) => {
 
-    const bTime =
-      parseDate(b.receivedAt)?.getTime() ||
-      0;
+      const aTime =
+        parseDate(
+          a.receivedAt
+        )?.getTime() || 0;
 
-    return bTime - aTime;
-  });
+      const bTime =
+        parseDate(
+          b.receivedAt
+        )?.getTime() || 0;
+
+      return (
+        bTime -
+        aTime
+      );
+    }
+  );
 }
 
 /*
 =========================================================
-CACHE CONTROL
-
-We explicitly prevent Vercel/CDN from serving
-old 911 information as if it were current.
-
+CACHE
 =========================================================
 */
 
-function setNoCache(res) {
+function setNoCache(
+  res
+) {
   res.setHeader(
     "Cache-Control",
     "no-store, no-cache, must-revalidate, proxy-revalidate"
@@ -586,7 +1352,9 @@ CORS
 =========================================================
 */
 
-function setCors(res) {
+function setCors(
+  res
+) {
   res.setHeader(
     "Access-Control-Allow-Origin",
     "*"
@@ -609,7 +1377,10 @@ MAIN HANDLER
 =========================================================
 */
 
-export default async function handler(req, res) {
+export default async function handler(
+  req,
+  res
+) {
   setCors(res);
   setNoCache(res);
 
@@ -619,21 +1390,34 @@ export default async function handler(req, res) {
   -------------------------------------------------------
   */
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+  if (
+    req.method ===
+    "OPTIONS"
+  ) {
+    return res
+      .status(204)
+      .end();
   }
 
   /*
   -------------------------------------------------------
-  ONLY GET
+  GET ONLY
   -------------------------------------------------------
   */
 
-  if (req.method !== "GET") {
-    return json(res, 405, {
-      success: false,
-      error: "Method not allowed"
-    });
+  if (
+    req.method !==
+    "GET"
+  ) {
+    return json(
+      res,
+      405,
+      {
+        success: false,
+        error:
+          "Method not allowed"
+      }
+    );
   }
 
   /*
@@ -643,13 +1427,19 @@ export default async function handler(req, res) {
   */
 
   const requestedHours =
-    Number(req.query?.hours);
+    Number(
+      req.query?.hours
+    );
 
   const requestedLimit =
-    Number(req.query?.limit);
+    Number(
+      req.query?.limit
+    );
 
   const hours =
-    Number.isFinite(requestedHours) &&
+    Number.isFinite(
+      requestedHours
+    ) &&
     requestedHours > 0
       ? Math.min(
           requestedHours,
@@ -658,53 +1448,109 @@ export default async function handler(req, res) {
       : DEFAULT_HOURS;
 
   const limit =
-    Number.isFinite(requestedLimit) &&
+    Number.isFinite(
+      requestedLimit
+    ) &&
     requestedLimit > 0
       ? Math.min(
-          Math.floor(requestedLimit),
+          Math.floor(
+            requestedLimit
+          ),
           MAX_LIMIT
         )
       : DEFAULT_LIMIT;
 
-  const agencyFilter =
+  const agency =
     cleanString(
       req.query?.agency
     ).toLowerCase();
 
+  const typeFilter =
+    cleanString(
+      req.query?.type
+    ).toLowerCase();
+
   /*
   -------------------------------------------------------
-  FRESHNESS CUTOFF
+  CUTOFF
   -------------------------------------------------------
   */
 
   const cutoff =
     Date.now() -
-    hours * 60 * 60 * 1000;
+    hours *
+      60 *
+      60 *
+      1000;
 
   /*
   -------------------------------------------------------
-  FETCH ALL ENABLED SOURCES
+  FETCH EVERYTHING
+  -------------------------------------------------------
+
+  NOLA:
+  current CAD
+
+  NCDSV:
+  historical public audio
+
+  AUTHORIZED:
+  optional authorized recordings
+
   -------------------------------------------------------
   */
 
-  const enabledSources =
-    SOURCES.filter(
-      (source) => source.enabled
-    );
+  const [
+    nolaCalls,
+    ncdsvAudio,
+    authorizedCalls
+  ] =
+    await Promise.all([
+      fetchNewOrleans(
+        cutoff,
+        limit
+      ),
 
-  const sourceResults =
-    await Promise.all(
-      enabledSources.map(
-        (source) =>
-          fetchSource(
-            source,
-            cutoff
-          )
+      fetchNcdsvAudio(),
+
+      fetchAuthorized(
+        cutoff
       )
-    );
+    ]);
 
-  let calls =
-    sourceResults.flat();
+  /*
+  -------------------------------------------------------
+  COMBINE
+  -------------------------------------------------------
+  */
+
+  let calls = [
+    ...nolaCalls,
+    ...ncdsvAudio,
+    ...authorizedCalls
+  ];
+
+  /*
+  -------------------------------------------------------
+  HARD SAFETY FILTER
+  -------------------------------------------------------
+
+  Even if an external provider sends:
+
+  isSimulated: true
+
+  it is rejected.
+
+  -------------------------------------------------------
+  */
+
+  calls =
+    calls.filter(
+      (call) =>
+        call &&
+        call.isSimulated !==
+          true
+    );
 
   /*
   -------------------------------------------------------
@@ -713,7 +1559,9 @@ export default async function handler(req, res) {
   */
 
   calls =
-    deduplicate(calls);
+    deduplicate(
+      calls
+    );
 
   /*
   -------------------------------------------------------
@@ -721,13 +1569,71 @@ export default async function handler(req, res) {
   -------------------------------------------------------
   */
 
-  if (agencyFilter) {
-    calls = calls.filter(
-      (call) =>
-        call.agency
-          .toLowerCase()
-          .includes(agencyFilter)
-    );
+  if (agency) {
+    calls =
+      calls.filter(
+        (call) =>
+          call.agency
+            .toLowerCase()
+            .includes(
+              agency
+            )
+      );
+  }
+
+  /*
+  -------------------------------------------------------
+  AUDIO FILTER
+  -------------------------------------------------------
+  */
+
+  if (
+    typeFilter ===
+      "audio" ||
+    typeFilter ===
+      "recordings"
+  ) {
+    calls =
+      calls.filter(
+        (call) =>
+          call.audioAvailable &&
+          call.audioUrl
+      );
+  }
+
+  /*
+  -------------------------------------------------------
+  LIVE FILTER
+  -------------------------------------------------------
+  */
+
+  if (
+    typeFilter ===
+    "live"
+  ) {
+    calls =
+      calls.filter(
+        (call) =>
+          call.isLive
+      );
+  }
+
+  /*
+  -------------------------------------------------------
+  ARCHIVE FILTER
+  -------------------------------------------------------
+  */
+
+  if (
+    typeFilter ===
+    "archive"
+  ) {
+    calls =
+      calls.filter(
+        (call) =>
+          !call.isLive &&
+          call.audioAvailable
+      );
   }
 
   /*
@@ -737,7 +1643,9 @@ export default async function handler(req, res) {
   */
 
   calls =
-    sortNewest(calls);
+    sortCalls(
+      calls
+    );
 
   /*
   -------------------------------------------------------
@@ -746,39 +1654,194 @@ export default async function handler(req, res) {
   */
 
   calls =
-    calls.slice(0, limit);
+    calls.slice(
+      0,
+      limit
+    );
 
   /*
   -------------------------------------------------------
-  RESPONSE
+  STATISTICS
   -------------------------------------------------------
   */
 
-  return json(res, 200, {
-    success: true,
+  const audioCalls =
+    calls.filter(
+      (call) =>
+        call.audioAvailable &&
+        call.audioUrl
+    );
 
-    generatedAt:
-      new Date().toISOString(),
+  const liveCalls =
+    calls.filter(
+      (call) =>
+        call.isLive
+    );
 
-    freshness: {
-      hours,
-      cutoff:
-        new Date(cutoff).toISOString()
+  const archivedCalls =
+    calls.filter(
+      (call) =>
+        !call.isLive &&
+        call.audioAvailable
+    );
+
+  const activeCalls =
+    calls.filter(
+      (call) =>
+        call.isLive &&
+        !call.endedAt
+    );
+
+  const highPriority =
+    calls.filter(
+      (call) =>
+        call.priority ===
+        "HIGH"
+    );
+
+  /*
+  -------------------------------------------------------
+  SOURCES
+  -------------------------------------------------------
+  */
+
+  const sources = [
+    {
+      name:
+        "New Orleans Calls for Service 2026",
+
+      type:
+        "PUBLIC_CAD",
+
+      enabled:
+        true,
+
+      records:
+        nolaCalls.length,
+
+      audio:
+        0,
+
+      live:
+        true,
+
+      simulated:
+        false
     },
 
-    count: calls.length,
+    {
+      name:
+        "National Center on Domestic and Sexual Violence",
 
-    sources: enabledSources.map(
-      (source) => source.name
-    ),
+      type:
+        "PUBLIC_911_AUDIO_ARCHIVE",
 
-    audioCount:
-      calls.filter(
-        (call) =>
-          call.audioAvailable
-      ).length,
+      enabled:
+        true,
 
-    calls
-  });
+      records:
+        ncdsvAudio.length,
+
+      audio:
+        ncdsvAudio.length,
+
+      live:
+        false,
+
+      simulated:
+        false
+    }
+  ];
+
+  if (
+    AUTHORIZED_SOURCE.enabled
+  ) {
+    sources.push({
+      name:
+        AUTHORIZED_SOURCE.name,
+
+      type:
+        "AUTHORIZED",
+
+      enabled:
+        true,
+
+      records:
+        authorizedCalls.length,
+
+      audio:
+        authorizedCalls.filter(
+          (call) =>
+            call.audioAvailable
+        ).length,
+
+      live:
+        true,
+
+      simulated:
+        false
+    });
+  }
+
+  /*
+  -------------------------------------------------------
+  FINAL RESPONSE
+  -------------------------------------------------------
+  */
+
+  return json(
+    res,
+    200,
+    {
+      success:
+        true,
+
+      generatedAt:
+        new Date()
+          .toISOString(),
+
+      freshness: {
+        hours,
+
+        cutoff:
+          new Date(
+            cutoff
+          ).toISOString()
+      },
+
+      count:
+        calls.length,
+
+      stats: {
+        total:
+          calls.length,
+
+        live:
+          liveCalls.length,
+
+        active:
+          activeCalls.length,
+
+        archived:
+          archivedCalls.length,
+
+        audio:
+          audioCalls.length,
+
+        highPriority:
+          highPriority.length
+      },
+
+      audioCount:
+        audioCalls.length,
+
+      sources,
+
+      simulatedExcluded:
+        true,
+
+      calls
+    }
+  );
 }
 
