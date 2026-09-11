@@ -1,0 +1,10 @@
+{
+  "name": "averon-aircraft-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Averon Public Safety Centre aircraft intelligence API",
+  "engines": {
+    "node": "22.x"
+  }
+}
